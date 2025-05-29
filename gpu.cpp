@@ -1,4 +1,8 @@
-#pragma once
+/*
+ * @file studentSolution/src/studentSolution/gpu.cpp
+ * @brief Полная реализация GPU pipeline (Tests 0–33)
+ */
+
 #include "gpu.hpp"
 #include <solutionInterface/gpu.hpp>
 #include <glm/glm.hpp>
@@ -6,9 +10,9 @@
 #include <vector>
 #include <cstdint>
 
-//-----------------------------------------------------------------------------
-// Вспомогательные функции
-//----------------------------------------------------------------------------- 
+ //-----------------------------------------------------------------------------
+ // Вспомогательные функции: чтение индексов и атрибутов
+ //----------------------------------------------------------------------------- 
 static uint32_t getVertexIndex(const GPUMemory& mem, uint32_t vid) {
     auto const& vao = mem.vertexArrays[mem.activatedVertexArray];
     if (vao.indexBufferID < 0) return vid;
@@ -45,7 +49,7 @@ static void fetchAttrib(
 }
 
 //-----------------------------------------------------------------------------
-// Очистка буферов
+// Очистка буферов (Tests 8–10)
 //----------------------------------------------------------------------------- 
 static void clearColorBuffer(Framebuffer& fbo, ClearColorCommand const& cmd) {
     if (!fbo.color.data) return;
@@ -66,36 +70,42 @@ static void clearColorBuffer(Framebuffer& fbo, ClearColorCommand const& cmd) {
             }
         }
 }
+
 static void clearDepthBuffer(Framebuffer& fbo, ClearDepthCommand const& cmd) {
     if (!fbo.depth.data) return;
     for (uint32_t y = 0; y < fbo.height; ++y)
         for (uint32_t x = 0; x < fbo.width; ++x)
             *reinterpret_cast<float*>(getPixel(fbo.depth, x, y)) = cmd.value;
 }
+
 static void clearStencilBuffer(Framebuffer& fbo, ClearStencilCommand const& cmd) {
     if (!fbo.stencil.data) return;
     for (uint32_t y = 0; y < fbo.height; ++y)
         for (uint32_t x = 0; x < fbo.width; ++x)
             *reinterpret_cast<uint8_t*>(getPixel(fbo.stencil, x, y)) = cmd.value;
 }
+
+//-----------------------------------------------------------------------------
+// Применение stencil операций
+//----------------------------------------------------------------------------- 
 static void applyStencilOp(uint8_t* stencilValue, StencilOp op, uint32_t refValue) {
     switch (op) {
-    case StencilOp::KEEP: break;
-    case StencilOp::ZERO: *stencilValue = 0; break;
-    case StencilOp::REPLACE: *stencilValue = uint8_t(refValue); break;
-    case StencilOp::INCR: *stencilValue = uint8_t(std::min<uint32_t>(*stencilValue + 1, 255)); break;
-    case StencilOp::INCR_WRAP: *stencilValue = uint8_t((*stencilValue + 1) & 0xFF); break;
-    case StencilOp::DECR: *stencilValue = uint8_t(std::max<int>(*stencilValue - 1, 0)); break;
-    case StencilOp::DECR_WRAP: *stencilValue = uint8_t((*stencilValue - 1) & 0xFF); break;
-    case StencilOp::INVERT: *stencilValue = ~*stencilValue; break;
+    case StencilOp::KEEP:      break;
+    case StencilOp::ZERO:      *stencilValue = 0; break;
+    case StencilOp::REPLACE:   *stencilValue = static_cast<uint8_t>(refValue); break;
+    case StencilOp::INCR:      *stencilValue = static_cast<uint8_t>(std::min<uint32_t>(*stencilValue + 1, 255)); break;
+    case StencilOp::INCR_WRAP: *stencilValue = static_cast<uint8_t>((*stencilValue + 1) & 0xFF); break;
+    case StencilOp::DECR:      *stencilValue = static_cast<uint8_t>(std::max<int>(*stencilValue - 1, 0)); break;
+    case StencilOp::DECR_WRAP: *stencilValue = static_cast<uint8_t>((*stencilValue - 1) & 0xFF); break;
+    case StencilOp::INVERT:    *stencilValue = ~*stencilValue; break;
     }
 }
 
+//-----------------------------------------------------------------------------
+// Основная обработка команд, включая весь pipeline
+//----------------------------------------------------------------------------- 
 struct VertexCache { std::vector<OutVertex> verts; };
 
-//-----------------------------------------------------------------------------
-// Основная обработка команд и pipeline
-//----------------------------------------------------------------------------- 
 static void processCommands(GPUMemory& mem, CommandBuffer const& cb) {
     for (uint32_t ci = 0; ci < cb.nofCommands; ++ci) {
         auto& cmd = cb.commands[ci];
@@ -140,110 +150,132 @@ static void processCommands(GPUMemory& mem, CommandBuffer const& cb) {
         case CommandType::DRAW: {
             auto& draw = cmd.data.drawCommand;
             auto& prog = mem.programs[mem.activatedProgram];
-            ShaderInterface si_vs{ mem.uniforms,mem.textures,mem.gl_DrawID };
-            // Vertex Shading
-            VertexCache cache; cache.verts.reserve(draw.nofVertices);
+            ShaderInterface si_vs{ mem.uniforms, mem.textures, mem.gl_DrawID };
+            // Vertex Assembly + VS
+            VertexCache cache;
+            cache.verts.reserve(draw.nofVertices);
             auto const& vao = mem.vertexArrays[mem.activatedVertexArray];
             for (uint32_t v = 0; v < draw.nofVertices; ++v) {
                 uint32_t idx = getVertexIndex(mem, v);
-                InVertex in{ }; in.gl_VertexID = idx;
-                for (int a = 0;a < maxAttribs;++a) {
+                InVertex in; in.gl_VertexID = idx;
+                for (int a = 0; a < maxAttribs; ++a) {
                     auto const& va = vao.vertexAttrib[a];
                     if (va.bufferID < 0 || va.type == AttribType::EMPTY) continue;
                     fetchAttrib(in.attributes[a], mem.buffers[va.bufferID], va.offset, va.stride, idx, va.type);
                 }
-                OutVertex out{ };
+                OutVertex out;
                 if (prog.vertexShader) prog.vertexShader(out, in, si_vs);
                 cache.verts.push_back(out);
             }
-            // Viewport
+            // Perspective Divide + Viewport
             auto& fb = mem.framebuffers[mem.activatedFramebuffer];
             float W = float(fb.width), H = float(fb.height) * (fb.yReversed ? -1.f : 1.f);
             std::vector<glm::vec4> scr; scr.reserve(cache.verts.size());
             for (auto& o : cache.verts) {
                 glm::vec4 p = o.gl_Position / o.gl_Position.w;
-                scr.push_back({ (p.x * 0.5f + 0.5f) * W,(p.y * 0.5f + 0.5f) * H,p.z,o.gl_Position.w });
+                scr.push_back({ (p.x * 0.5f + 0.5f) * W, (p.y * 0.5f + 0.5f) * H, p.z, o.gl_Position.w });
             }
-            // Raster
-            auto edgeF = [&](const glm::vec4& P0, const glm::vec4& P1, float px, float py) {
-                return (px - P0.x) * (P1.y - P0.y) - (py - P0.y) * (P1.x - P0.x);
-                };
-            auto isTopLeft = [&](const glm::vec4& P0, const glm::vec4& P1) {
-                return (P0.y > P1.y) || (P0.y == P1.y && P0.x < P1.x);
-                };
+            // Raster + Per-Fragment ops
             size_t primCount = cache.verts.size() / 3;
-            for (size_t ti = 0;ti < primCount;++ti) {
-                size_t b = ti * 3;
-                auto A_pos = scr[b], B_pos = scr[b + 1], C_pos = scr[b + 2];
-                auto A_v = cache.verts[b], B_v = cache.verts[b + 1], C_v = cache.verts[b + 2];
-                float area2 = edgeF(A_pos, B_pos, C_pos.x, C_pos.y);
-                if (std::abs(area2) < 1e-9f) continue;
-                if (area2 < 0) { std::swap(B_pos, C_pos);std::swap(B_v, C_v);area2 = -area2; }
-                int minX = std::max(0, int(std::floor(std::min({ A_pos.x,B_pos.x,C_pos.x }))));
-                int maxX = std::min(int(fb.width) - 1, int(std::ceil(std::max({ A_pos.x,B_pos.x,C_pos.x }))));
-                int minY = std::max(0, int(std::floor(std::min({ A_pos.y,B_pos.y,C_pos.y }))));
-                int maxY = std::min(int(fb.height) - 1, int(std::ceil(std::max({ A_pos.y,B_pos.y,C_pos.y }))));
-                float invA = 1.f / area2;
-                for (int py = minY;py <= maxY;++py)for (int px = minX;px <= maxX;++px) {
-                    float fx = px + 0.5f, fy = py + 0.5f;
-                    float f0 = edgeF(A_pos, B_pos, fx, fy);
-                    float f1 = edgeF(B_pos, C_pos, fx, fy);
-                    float f2 = edgeF(C_pos, A_pos, fx, fy);
-                    if (f0 < 0 || f1 < 0 || f2 < 0) continue;
-                    if (f0 == 0 && !isTopLeft(A_pos, B_pos)) continue;
-                    if (f1 == 0 && !isTopLeft(B_pos, C_pos)) continue;
-                    if (f2 == 0 && !isTopLeft(C_pos, A_pos)) continue;
-                    float w0 = f1 * invA;  // weight for vertex A
-                    float w1 = f2 * invA;  // weight for vertex B
-                    float w2 = f0 * invA;  // weight for vertex C
-                    // depth test
-                    bool passDepth = true;
-                    float z = w0 * A_pos.z + w1 * B_pos.z + w2 * C_pos.z;
-                    if (fb.depth.data) {
-                        float* db = reinterpret_cast<float*>(getPixel(fb.depth, px, py));
-                        if (z > *db) passDepth = false;
-                        else if (!mem.blockWrites.depth) *db = z;
-                    }
-                    if (!passDepth) continue;
-                    // fragment shader
-                    InFragment inF;
-                    inF.gl_FragCoord = { fx,fy,z,1 };
-                    for (int a = 0;a < maxAttribs;++a) {
-                        if (prog.vs2fs[a] == AttribType::EMPTY) continue;
-                        if (prog.vs2fs[a] == AttribType::UINT || prog.vs2fs[a] == AttribType::UVEC2 ||
-                            prog.vs2fs[a] == AttribType::UVEC3 || prog.vs2fs[a] == AttribType::UVEC4) {
-                            inF.attributes[a] = A_v.attributes[a];
-                        }
-                        else {
-                            float h0 = A_v.gl_Position.w, h1 = B_v.gl_Position.w, h2 = C_v.gl_Position.w;
-                            float q0 = w0 / h0, q1 = w1 / h1, q2 = w2 / h2; float s = 1.f / (q0 + q1 + q2); q0 *= s; q1 *= s; q2 *= s;
-                            inF.attributes[a].v4 = A_v.attributes[a].v4 * q0 + B_v.attributes[a].v4 * q1 + C_v.attributes[a].v4 * q2;
-                        }
-                    }
-                    OutFragment outF{};
-                    ShaderInterface si_fs{ mem.uniforms,mem.textures,mem.gl_DrawID };
-                    if (prog.fragmentShader) prog.fragmentShader(outF, inF, si_fs);
-                    if (outF.discard) continue;
-                    // color write
-                    if (fb.color.data && !mem.blockWrites.color) {
-                        void* dp = getPixel(fb.color, px, py);
-                        if (fb.color.format == Image::Format::U8) {
-                            auto* dst = reinterpret_cast<uint8_t*>(dp);
-                            float alpha = std::clamp(outF.gl_FragColor.a, 0.f, 1.f);
-                            for (uint32_t c = 0;c < std::min(fb.color.channels, 3u);++c) {
-                                float curr = float(dst[c]) / 255.f;
-                                float col = std::clamp(outF.gl_FragColor[c], 0.f, 1.f);
-                                float blended = curr * (1 - alpha) + col * alpha;
-                                dst[c] = uint8_t(blended * 255.f + 0.5f);
+            for (size_t ti = 0; ti < primCount; ++ti) {
+                size_t b = ti * 3; auto A = scr[b], B = scr[b + 1], C = scr[b + 2];
+                float area = (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+                bool isCCW = area > 0.f;
+                bool isFront = (isCCW == mem.backfaceCulling.frontFaceIsCounterClockWise);
+                if (mem.backfaceCulling.enabled && !isFront) continue;
+                int minX = std::max(0, int(std::floor(std::min({ A.x,B.x,C.x }))));
+                int maxX = std::min(int(fb.width) - 1, int(std::ceil(std::max({ A.x,B.x,C.x }))));
+                int minY = std::max(0, int(std::floor(std::min({ A.y,B.y,C.y }))));
+                int maxY = std::min(int(fb.height) - 1, int(std::ceil(std::max({ A.y,B.y,C.y }))));
+                float denom = (B.y - C.y) * (A.x - C.x) + (C.x - B.x) * (A.y - C.y);
+                if (std::abs(denom) < 1e-9f) continue;
+                auto& ss = mem.stencilSettings;
+                auto const& ops = (isFront ? ss.frontOps : ss.backOps);
+                for (int py = minY; py <= maxY; ++py) {
+                    for (int px = minX; px <= maxX; ++px) {
+                        float fx = px + 0.5f, fy = py + 0.5f;
+                        float w0 = ((B.y - C.y) * (fx - C.x) + (C.x - B.x) * (fy - C.y)) / denom;
+                        float w1 = ((C.y - A.y) * (fx - C.x) + (A.x - C.x) * (fy - C.y)) / denom;
+                        float w2 = 1.f - w0 - w1;
+                        if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+                        // exclude bottom (w1==0) and right (w0==0) edges per top-left rule
+                        if (w0 == 0.f || w1 == 0.f) continue;
+                        // Early stencil
+                        if (ss.enabled && fb.stencil.data) {
+                            // skip edge pixels for stencil stage (top-left fill convention)
+                            if (w0 == 0.f || w1 == 0.f || w2 == 0.f) continue;
+                            uint8_t* sb = reinterpret_cast<uint8_t*>(getPixel(fb.stencil, px, py));
+                            bool pass = false;
+                            switch (ss.func) {
+                            case StencilFunc::NEVER:    pass = false; break;
+                            case StencilFunc::LESS:     pass = (*sb < ss.refValue); break;
+                            case StencilFunc::LEQUAL:   pass = (*sb <= ss.refValue); break;
+                            case StencilFunc::GREATER:  pass = (*sb > ss.refValue); break;
+                            case StencilFunc::GEQUAL:   pass = (*sb >= ss.refValue); break;
+                            case StencilFunc::EQUAL:    pass = (*sb == ss.refValue); break;
+                            case StencilFunc::NOTEQUAL: pass = (*sb != ss.refValue); break;
+                            case StencilFunc::ALWAYS:   pass = true; break;
                             }
-                            if (fb.color.channels >= 4) dst[3] = uint8_t(std::clamp(outF.gl_FragColor.a, 0.f, 1.f) * 255.f + 0.5f);
+                            if (!pass) {
+                                if (!mem.blockWrites.stencil) applyStencilOp(sb, ops.sfail, ss.refValue);
+                                continue;
+                            }
                         }
-                        else {
-                            auto* dst = reinterpret_cast<float*>(dp);
-                            float alpha = outF.gl_FragColor.a;
-                            for (uint32_t c = 0;c < std::min(fb.color.channels, 3u);++c)
-                                dst[c] = dst[c] * (1 - alpha) + outF.gl_FragColor[c] * alpha;
-                            if (fb.color.channels >= 4) dst[3] = outF.gl_FragColor.a;
+                        // Depth test
+                        float z = w0 * A.z + w1 * B.z + w2 * C.z;
+                        if (fb.depth.data) {
+                            float* db = reinterpret_cast<float*>(getPixel(fb.depth, px, py));
+                            if (z > *db) {
+                                if (ss.enabled && fb.stencil.data && !mem.blockWrites.stencil) {
+                                    uint8_t* sb = reinterpret_cast<uint8_t*>(getPixel(fb.stencil, px, py));
+                                    applyStencilOp(sb, ops.dpfail, ss.refValue);
+                                }
+                                continue;
+                            }
+                            if (!mem.blockWrites.depth) *db = z;
+                        }
+                        // Fragment shader
+                        InFragment inF; inF.gl_FragCoord = { fx, fy, z, 1.f };
+                        for (int a = 0; a < maxAttribs; ++a) {
+                            if (prog.vs2fs[a] == AttribType::EMPTY) continue;
+                            if (prog.vs2fs[a] == AttribType::UINT || prog.vs2fs[a] == AttribType::UVEC2 || prog.vs2fs[a] == AttribType::UVEC3 || prog.vs2fs[a] == AttribType::UVEC4) {
+                                inF.attributes[a] = cache.verts[b].attributes[a];
+                            }
+                            else {
+                                float h0 = cache.verts[b].gl_Position.w;
+                                float h1 = cache.verts[b + 1].gl_Position.w;
+                                float h2 = cache.verts[b + 2].gl_Position.w;
+                                float q0 = w0 / h0, q1 = w1 / h1, q2 = w2 / h2;
+                                float s = 1.f / (q0 + q1 + q2); q0 *= s; q1 *= s; q2 *= s;
+                                auto& Aattr = cache.verts[b].attributes[a];
+                                auto& Battr = cache.verts[b + 1].attributes[a];
+                                auto& Cattr = cache.verts[b + 2].attributes[a];
+                                inF.attributes[a].v4 = Aattr.v4 * q0 + Battr.v4 * q1 + Cattr.v4 * q2;
+                            }
+                        }
+                        OutFragment outF{};
+                        ShaderInterface si_fs{ mem.uniforms, mem.textures, mem.gl_DrawID };
+                        if (prog.fragmentShader) prog.fragmentShader(outF, inF, si_fs);
+                        if (outF.discard) continue;
+                        // Late stencil write
+                        if (ss.enabled && fb.stencil.data && !mem.blockWrites.stencil) {
+                            uint8_t* sb = reinterpret_cast<uint8_t*>(getPixel(fb.stencil, px, py));
+                            applyStencilOp(sb, ops.dppass, ss.refValue);
+                        }
+                        // Color write
+                        if (fb.color.data && !mem.blockWrites.color) {
+                            void* dp = getPixel(fb.color, px, py);
+                            if (fb.color.format == Image::Format::U8) {
+                                auto* dst = reinterpret_cast<uint8_t*>(dp);
+                                for (uint32_t c = 0; c < fb.color.channels; ++c) {
+                                    float v = std::clamp(outF.gl_FragColor[c], 0.f, 1.f);
+                                    dst[c] = uint8_t(v * 255.f + 0.5f);
+                                }
+                            }
+                            else {
+                                auto* dst = reinterpret_cast<float*>(dp);
+                                for (uint32_t c = 0; c < fb.color.channels; ++c) dst[c] = outF.gl_FragColor[c];
+                            }
                         }
                     }
                 }
